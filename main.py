@@ -13,453 +13,491 @@
 # NO usa librerías de expresiones regulares.
 # ============================================================
 
+from dataclasses import dataclass, field
 from collections import deque
+from typing import Optional, Dict, Set, List, Tuple, FrozenSet
 
-# ------------------------------------------------------------
-# Nodo del árbol sintáctico
-# ------------------------------------------------------------
+# No se usa la librería re ni ninguna librería de expresiones regulares.
+
+EPSILON = "ε"
+ENDMARKER = "#"
+CONCAT = "·"  
+
+Token = Tuple[str, str]
+
+
+@dataclass
 class Node:
-    def __init__(self, value, left=None, right=None, position=None):
-        self.value = value
-        self.left = left
-        self.right = right
-        self.position = position
-
-        self.nullable = False
-        self.firstpos = set()
-        self.lastpos = set()
-
-    def __repr__(self):
-        return f"Node({self.value})"
+    kind: str
+    value: str = ""
+    left: Optional["Node"] = None
+    right: Optional["Node"] = None
+    child: Optional["Node"] = None
+    pos: Optional[int] = None
+    nullable: bool = False
+    firstpos: Set[int] = field(default_factory=set)
+    lastpos: Set[int] = field(default_factory=set)
 
 
-# ------------------------------------------------------------
-# Utilidades para regex
-# ------------------------------------------------------------
-OPERATORS = {'|', '.', '*', '+', '?', '(', ')'}
-UNARY_OPERATORS = {'*', '+', '?'}
+def tokenize(expr: str) -> List[Token]:
+    """Convierte la cadena de entrada en tokens, sin usar expresiones regulares."""
+    tokens: List[Token] = []
+    operators = {"|", "*", "+", "?", "(", ")"}
+    i = 0
+
+    while i < len(expr):
+        c = expr[i]
+
+        if c in {" ", "\t", "\n", "\r"}:
+            i += 1
+            continue
+
+        if c == "\\":
+            if i + 1 >= len(expr):
+                raise ValueError("La expresión termina con una barra invertida '\\'.")
+            tokens.append(("SYM", expr[i + 1]))
+            i += 2
+            continue
+
+        if c in operators:
+            if c == "(":
+                tokens.append(("LPAREN", c))
+            elif c == ")":
+                tokens.append(("RPAREN", c))
+            else:
+                tokens.append(("OP", c))
+        else:
+            if c == ENDMARKER:
+                raise ValueError("No uses '#': el programa lo agrega automáticamente.")
+            if c == CONCAT:
+                raise ValueError(f"No uses '{CONCAT}': se usa internamente para concatenación.")
+            tokens.append(("SYM", c))
+
+        i += 1
+
+    if not tokens:
+        raise ValueError("La expresión regular no puede estar vacía.")
+
+    return tokens
 
 
-def is_symbol(c):
-    return c not in OPERATORS
+def can_end_expression(tok: Token) -> bool:
+    return tok[0] == "SYM" or tok[0] == "RPAREN" or (tok[0] == "OP" and tok[1] in {"*", "+", "?"})
 
 
-def insert_concat(regex):
-    """
-    Inserta concatenación explícita '.' donde corresponde.
-    Ejemplo:
-        a(b|c)*   -> a.(b|c)*
-        ab+c      -> a.b+.c
-    """
-    result = []
-    for i in range(len(regex)):
-        c1 = regex[i]
-        result.append(c1)
-
-        if i + 1 < len(regex):
-            c2 = regex[i + 1]
-
-            # Casos donde debe ir concatenación:
-            # símbolo, ')', '*', '+', '?' seguido de símbolo o '('
-            if ((is_symbol(c1) or c1 in {')', '*', '+', '?'}) and
-                (is_symbol(c2) or c2 == '(')):
-                result.append('.')
-
-    return ''.join(result)
+def can_start_expression(tok: Token) -> bool:
+    return tok[0] == "SYM" or tok[0] == "LPAREN"
 
 
-def to_postfix(regex):
-    """
-    Convierte de infix a postfix con Shunting Yard.
-    Precedencia:
-        *, +, ?  (más alta)
-        .
-        |
-    """
-    precedence = {
-        '|': 1,
-        '.': 2,
-        '*': 3,
-        '+': 3,
-        '?': 3
-    }
+def insert_concat(tokens: List[Token]) -> List[Token]:
+    """Inserta el operador interno de concatenación donde sea necesario."""
+    result: List[Token] = []
 
-    output = []
-    stack = []
+    for i, tok in enumerate(tokens):
+        if i > 0:
+            prev = tokens[i - 1]
+            if can_end_expression(prev) and can_start_expression(tok):
+                result.append(("OP", CONCAT))
+        result.append(tok)
 
-    for c in regex:
-        if is_symbol(c):
-            output.append(c)
-        elif c == '(':
-            stack.append(c)
-        elif c == ')':
-            while stack and stack[-1] != '(':
+    return result
+
+
+def validate_tokens(tokens: List[Token]) -> None:
+    """Valida errores básicos de sintaxis."""
+    expecting_operand = True
+    balance = 0
+
+    for typ, val in tokens:
+        if typ == "SYM":
+            expecting_operand = False
+
+        elif typ == "LPAREN":
+            balance += 1
+            expecting_operand = True
+
+        elif typ == "RPAREN":
+            balance -= 1
+            if balance < 0:
+                raise ValueError("Hay un paréntesis de cierre ')' sin apertura.")
+            if expecting_operand:
+                raise ValueError("Hay paréntesis vacíos o un operador antes de ')'.")
+            expecting_operand = False
+
+        elif typ == "OP":
+            if val in {"*", "+", "?"}:
+                if expecting_operand:
+                    raise ValueError(f"El operador '{val}' no tiene operando a la izquierda.")
+                expecting_operand = False
+
+            elif val in {"|", CONCAT}:
+                if expecting_operand:
+                    raise ValueError(f"El operador '{val}' no tiene operando a la izquierda.")
+                expecting_operand = True
+
+    if balance != 0:
+        raise ValueError("Hay paréntesis sin cerrar.")
+
+    if expecting_operand:
+        raise ValueError("La expresión termina con un operador binario.")
+
+
+def to_postfix(tokens: List[Token]) -> List[Token]:
+    """Convierte de notación infija a postfija usando Shunting Yard."""
+    validate_tokens(tokens)
+
+    precedence = {"|": 1, CONCAT: 2}
+    output: List[Token] = []
+    stack: List[Token] = []
+
+    for typ, val in tokens:
+        if typ == "SYM":
+            output.append((typ, val))
+
+        elif typ == "LPAREN":
+            stack.append((typ, val))
+
+        elif typ == "RPAREN":
+            while stack and stack[-1][0] != "LPAREN":
                 output.append(stack.pop())
+
             if not stack:
                 raise ValueError("Paréntesis desbalanceados.")
-            stack.pop()  # quitar '('
-        else:
-            # operador
-            while (stack and stack[-1] != '(' and
-                   precedence.get(stack[-1], 0) >= precedence.get(c, 0)):
-                output.append(stack.pop())
-            stack.append(c)
+
+            stack.pop()
+
+        elif typ == "OP":
+            if val in {"*", "+", "?"}:
+                output.append((typ, val))
+            else:
+                while (
+                    stack
+                    and stack[-1][0] == "OP"
+                    and stack[-1][1] in precedence
+                    and precedence[stack[-1][1]] >= precedence[val]
+                ):
+                    output.append(stack.pop())
+                stack.append((typ, val))
 
     while stack:
-        if stack[-1] in {'(', ')'}:
+        if stack[-1][0] == "LPAREN":
             raise ValueError("Paréntesis desbalanceados.")
         output.append(stack.pop())
 
-    return ''.join(output)
+    return output
 
 
-# ------------------------------------------------------------
-# Construcción del árbol sintáctico y followpos
-# ------------------------------------------------------------
-def build_syntax_tree(postfix):
-    """
-    Construye el árbol sintáctico a partir del postfix.
-    También asigna posiciones a las hojas.
-    """
-    stack = []
-    pos_counter = 1
-    pos_to_symbol = {}
+def build_ast(postfix: List[Token]) -> Node:
+    """Construye el árbol sintáctico a partir de la expresión postfija."""
+    stack: List[Node] = []
 
-    for token in postfix:
-        if is_symbol(token):
-            node = Node(token, position=pos_counter)
-            pos_to_symbol[pos_counter] = token
-            pos_counter += 1
-            stack.append(node)
+    for typ, val in postfix:
+        if typ == "SYM":
+            stack.append(Node("leaf", val))
 
-        elif token in UNARY_OPERATORS:
-            if not stack:
-                raise ValueError(f"Operador unary '{token}' inválido.")
-            child = stack.pop()
-            node = Node(token, left=child)
-            stack.append(node)
+        elif typ == "OP":
+            if val in {"*", "+", "?"}:
+                if not stack:
+                    raise ValueError(f"Falta operando para '{val}'.")
 
-        elif token in {'|', '.'}:
-            if len(stack) < 2:
-                raise ValueError(f"Operador binary '{token}' inválido.")
-            right = stack.pop()
-            left = stack.pop()
-            node = Node(token, left=left, right=right)
-            stack.append(node)
+                child = stack.pop()
+                kind = {"*": "star", "+": "plus", "?": "optional"}[val]
+                stack.append(Node(kind, val, child=child))
 
-        else:
-            raise ValueError(f"Token desconocido: {token}")
+            elif val in {"|", CONCAT}:
+                if len(stack) < 2:
+                    raise ValueError(f"Faltan operandos para '{val}'.")
+
+                right = stack.pop()
+                left = stack.pop()
+                kind = "union" if val == "|" else "concat"
+                stack.append(Node(kind, val, left=left, right=right))
 
     if len(stack) != 1:
-        raise ValueError("La expresión regular es inválida.")
+        raise ValueError("La expresión regular no es válida.")
 
-    root = stack[0]
-    return root, pos_to_symbol
+    return stack[0]
 
 
-def compute_functions(node, followpos):
-    """
-    Calcula nullable, firstpos, lastpos y llena followpos.
-    """
-    if node is None:
-        return
+def assign_positions(root: Node) -> Dict[int, str]:
+    """Etiqueta las hojas del árbol sintáctico con posiciones."""
+    pos_to_symbol: Dict[int, str] = {}
+    counter = 1
 
-    # Hoja
-    if node.left is None and node.right is None:
-        node.nullable = False
-        node.firstpos = {node.position}
-        node.lastpos = {node.position}
-        if node.position not in followpos:
-            followpos[node.position] = set()
-        return
+    def walk(n: Optional[Node]) -> None:
+        nonlocal counter
+        if n is None:
+            return
 
-    # Unario
-    if node.value in UNARY_OPERATORS:
-        compute_functions(node.left, followpos)
-        child = node.left
+        if n.kind == "leaf":
+            # ε no recibe posición.
+            if n.value != EPSILON:
+                n.pos = counter
+                pos_to_symbol[counter] = n.value
+                counter += 1
+            return
 
-        if node.value == '*':
-            node.nullable = True
-            node.firstpos = set(child.firstpos)
-            node.lastpos = set(child.lastpos)
-
-            for i in child.lastpos:
-                followpos[i].update(child.firstpos)
-
-        elif node.value == '+':
-            # A+ = una o más repeticiones
-            node.nullable = child.nullable
-            node.firstpos = set(child.firstpos)
-            node.lastpos = set(child.lastpos)
-
-            for i in child.lastpos:
-                followpos[i].update(child.firstpos)
-
-        elif node.value == '?':
-            # A? = epsilon o A
-            node.nullable = True
-            node.firstpos = set(child.firstpos)
-            node.lastpos = set(child.lastpos)
-
-        return
-
-    # Binario
-    compute_functions(node.left, followpos)
-    compute_functions(node.right, followpos)
-
-    if node.value == '|':
-        node.nullable = node.left.nullable or node.right.nullable
-        node.firstpos = node.left.firstpos | node.right.firstpos
-        node.lastpos = node.left.lastpos | node.right.lastpos
-
-    elif node.value == '.':
-        node.nullable = node.left.nullable and node.right.nullable
-
-        if node.left.nullable:
-            node.firstpos = node.left.firstpos | node.right.firstpos
+        if n.kind in {"union", "concat"}:
+            walk(n.left)
+            walk(n.right)
         else:
-            node.firstpos = set(node.left.firstpos)
+            walk(n.child)
 
-        if node.right.nullable:
-            node.lastpos = node.left.lastpos | node.right.lastpos
+    walk(root)
+    return pos_to_symbol
+
+
+def compute_functions(root: Node, pos_to_symbol: Dict[int, str]) -> Dict[int, Set[int]]:
+    """Calcula nullable, firstpos, lastpos y followpos."""
+    followpos: Dict[int, Set[int]] = {pos: set() for pos in pos_to_symbol}
+
+    def post(n: Node) -> None:
+        if n.kind == "leaf":
+            if n.value == EPSILON:
+                n.nullable = True
+                n.firstpos = set()
+                n.lastpos = set()
+            else:
+                n.nullable = False
+                n.firstpos = {n.pos} if n.pos is not None else set()
+                n.lastpos = {n.pos} if n.pos is not None else set()
+
+        elif n.kind == "union":
+            post(n.left)   
+            post(n.right)  
+            n.nullable = n.left.nullable or n.right.nullable  
+            n.firstpos = n.left.firstpos | n.right.firstpos   
+            n.lastpos = n.left.lastpos | n.right.lastpos      
+
+        elif n.kind == "concat":
+            post(n.left)   
+            post(n.right) 
+
+            n.nullable = n.left.nullable and n.right.nullable  
+
+            if n.left.nullable: 
+                n.firstpos = n.left.firstpos | n.right.firstpos  
+            else:
+                n.firstpos = set(n.left.firstpos) 
+
+            if n.right.nullable:
+                n.lastpos = n.left.lastpos | n.right.lastpos  
+            else:
+                n.lastpos = set(n.right.lastpos)  
+           
+            
+            for p in n.left.lastpos: 
+                followpos[p].update(n.right.firstpos) 
+
+        elif n.kind == "star":
+            post(n.child)  
+            n.nullable = True
+            n.firstpos = set(n.child.firstpos) 
+            n.lastpos = set(n.child.lastpos)    
+
+            for p in n.child.lastpos:  
+                followpos[p].update(n.child.firstpos) 
+
+        elif n.kind == "plus":
+            post(n.child)  
+            n.nullable = n.child.nullable  
+            n.firstpos = set(n.child.firstpos) 
+            n.lastpos = set(n.child.lastpos)   
+
+            
+            for p in n.child.lastpos: 
+                followpos[p].update(n.child.firstpos)
+        elif n.kind == "optional":
+            post(n.child) 
+            # c? equivale a c | ε.
+            n.nullable = True
+            n.firstpos = set(n.child.firstpos)  
+            n.lastpos = set(n.child.lastpos)    
+
         else:
-            node.lastpos = set(node.right.lastpos)
+            raise ValueError(f"Nodo desconocido: {n.kind}")
 
-        for i in node.left.lastpos:
-            followpos[i].update(node.right.firstpos)
+    post(root)
+    return followpos
 
 
-# ------------------------------------------------------------
-# Construcción del AFD directo
-# ------------------------------------------------------------
-def build_dfa(root, followpos, pos_to_symbol):
-    """
-    Construye el AFD usando firstpos, followpos y el símbolo final '#'.
-    """
-    alphabet = sorted(set(sym for sym in pos_to_symbol.values() if sym != '#'))
+def build_direct_dfa(expr: str) -> dict:
+    """Construye el AFD directo para una expresión regular."""
+    tokens = insert_concat(tokenize(expr))
+    postfix = to_postfix(tokens)
+    user_root = build_ast(postfix)
 
-    # Encontrar la posición del símbolo final '#'
+    # Expresión aumentada: r#
+    augmented_root = Node("concat", CONCAT, left=user_root, right=Node("leaf", ENDMARKER))
+
+    pos_to_symbol = assign_positions(augmented_root)
+    followpos = compute_functions(augmented_root, pos_to_symbol)
+
     hash_pos = None
-    for pos, sym in pos_to_symbol.items():
-        if sym == '#':
+    for pos, symbol in pos_to_symbol.items():
+        if symbol == ENDMARKER:
             hash_pos = pos
             break
 
     if hash_pos is None:
-        raise ValueError("No se encontró el símbolo final '#'.")
+        raise ValueError("No se encontró la posición de aceptación '#'.")
 
-    start_state = frozenset(root.firstpos)
+    alphabet = sorted({s for s in pos_to_symbol.values() if s not in {ENDMARKER, EPSILON}})
 
-    states = []
-    state_ids = {}
-    transitions = {}
-    accepting_states = set()
+    state_map: Dict[FrozenSet[int], str] = {}
+    states: List[FrozenSet[int]] = []
+    transitions: Dict[FrozenSet[int], Dict[str, FrozenSet[int]]] = {}
 
-    queue = deque([start_state])
-    state_ids[start_state] = "S0"
-    states.append(start_state)
+    def add_state(pos_set: Set[int]) -> FrozenSet[int]:
+        frozen = frozenset(pos_set)
+        if frozen not in state_map:
+            state_map[frozen] = f"S{len(states)}"
+            states.append(frozen)
+        return frozen
+
+    start = add_state(augmented_root.firstpos)
+    queue = deque([start])
+    visited = {start}
 
     while queue:
-        current = queue.popleft()
-        current_name = state_ids[current]
-        transitions[current_name] = {}
+        state = queue.popleft()
+        transitions[state] = {}
 
-        if hash_pos in current:
-            accepting_states.add(current_name)
+        for symbol in alphabet:
+            dest: Set[int] = set()
 
-        for a in alphabet:
-            u = set()
+            for p in state:
+                if pos_to_symbol[p] == symbol:
+                    dest.update(followpos[p])
 
-            for p in current:
-                if pos_to_symbol[p] == a:
-                    u.update(followpos[p])
+            dest_frozen = frozenset(dest)
+            transitions[state][symbol] = dest_frozen
 
-            if u:
-                u = frozenset(u)
-                if u not in state_ids:
-                    state_ids[u] = f"S{len(state_ids)}"
-                    states.append(u)
-                    queue.append(u)
-                transitions[current_name][a] = state_ids[u]
+            if dest_frozen and dest_frozen not in state_map:
+                add_state(dest)
 
-    return {
-        "alphabet": alphabet,
-        "states": states,
-        "state_ids": state_ids,
-        "transitions": transitions,
-        "start_state": "S0",
-        "accepting_states": accepting_states,
-        "hash_pos": hash_pos
-    }
+            if dest_frozen and dest_frozen not in visited:
+                visited.add(dest_frozen)
+                queue.append(dest_frozen)
 
-
-# ------------------------------------------------------------
-# Simulación del AFD
-# ------------------------------------------------------------
-def simulate_dfa(dfa, string):
-    current = dfa["start_state"]
-
-    for ch in string:
-        if ch not in dfa["alphabet"]:
-            return False
-        if ch not in dfa["transitions"].get(current, {}):
-            return False
-        current = dfa["transitions"][current][ch]
-
-    return current in dfa["accepting_states"]
-
-
-# ------------------------------------------------------------
-# Impresión de resultados
-# ------------------------------------------------------------
-def print_followpos(followpos, pos_to_symbol):
-    print("\nTabla followpos:")
-    print("Posición | Símbolo | followpos")
-    print("--------------------------------")
-    for pos in sorted(pos_to_symbol.keys()):
-        if pos_to_symbol[pos] == '#':
-            continue
-        fp = sorted(followpos[pos])
-        print(f"{pos:^8} | {pos_to_symbol[pos]:^7} | {fp}")
-
-
-def print_positions(pos_to_symbol):
-    print("\nPosiciones de hojas:")
-    print("Posición | Símbolo")
-    print("------------------")
-    for pos in sorted(pos_to_symbol.keys()):
-        print(f"{pos:^8} | {pos_to_symbol[pos]:^7}")
-
-
-def print_syntax_info(root):
-    print("\nFunciones de la raíz:")
-    print(f"nullable : {root.nullable}")
-    print(f"firstpos : {sorted(root.firstpos)}")
-    print(f"lastpos  : {sorted(root.lastpos)}")
-
-
-def print_dfa_table(dfa):
-    alphabet = dfa["alphabet"]
-    transitions = dfa["transitions"]
-    accepting = dfa["accepting_states"]
-
-    print("\nTabla de transición del AFD:")
-    header = ["Estado"] + alphabet
-    print(" | ".join(f"{h:^10}" for h in header))
-    print("-" * (13 * len(header)))
-
-    # Ordenar estados por número
-    ordered_states = sorted(
-        transitions.keys(),
-        key=lambda s: int(s[1:])
-    )
-
-    for state in ordered_states:
-        label = state
-        if state == dfa["start_state"]:
-            label += "(I)"
-        if state in accepting:
-            label += "(F)"
-
-        row = [f"{label:^10}"]
-        for sym in alphabet:
-            row.append(f"{transitions[state].get(sym, '-'):^10}")
-        print(" | ".join(row))
-
-    print("\nConjuntos que representa cada estado:")
-    inv = {v: k for k, v in dfa["state_ids"].items()}
-    for state_name in sorted(inv.keys(), key=lambda s: int(s[1:])):
-        print(f"{state_name} = {sorted(inv[state_name])}")
-
-
-# ------------------------------------------------------------
-# Función principal de construcción
-# ------------------------------------------------------------
-def regex_to_dfa(regex):
-    """
-    Construye el AFD directo a partir de la regex.
-    Internamente agrega:
-        (regex).#
-    """
-    if not regex:
-        raise ValueError("La expresión regular no puede estar vacía.")
-
-    # Agregamos concatenación explícita primero
-    regex = insert_concat(regex)
-
-    # Agregamos símbolo terminal #
-    augmented = f"({regex}).#"
-
-    postfix = to_postfix(augmented)
-    root, pos_to_symbol = build_syntax_tree(postfix)
-
-    followpos = {pos: set() for pos in pos_to_symbol}
-    compute_functions(root, followpos)
-
-    dfa = build_dfa(root, followpos, pos_to_symbol)
+    accept_states = {state for state in states if hash_pos in state}
 
     return {
-        "original_regex": regex,
-        "augmented_regex": augmented,
-        "postfix": postfix,
-        "root": root,
+        "expr": expr,
         "pos_to_symbol": pos_to_symbol,
         "followpos": followpos,
-        "dfa": dfa
+        "alphabet": alphabet,
+        "states": states,
+        "state_map": state_map,
+        "transitions": transitions,
+        "start": start,
+        "accept_states": accept_states,
+        "hash_pos": hash_pos,
     }
 
 
-# ------------------------------------------------------------
-# Interfaz de consola
-# ------------------------------------------------------------
-def main():
-    print("==============================================")
-    print(" Conversión directa de ER a AFD y simulación ")
-    print("==============================================")
-    print("Operadores soportados: |  *  +  ?  y concatenación implícita")
-    print("Ejemplos válidos:")
-    print("  a(b|c)*")
-    print("  (ab)+c")
-    print("  a?bc")
-    print()
+def set_to_str(values) -> str:
+    if not values:
+        return "∅"
+    return "{" + ",".join(str(x) for x in sorted(values)) + "}"
 
-    while True:
-        try:
-            regex = input("Ingrese una expresión regular (o 'salir'): ").strip()
-            if regex.lower() == "salir":
-                print("Programa finalizado.")
-                break
 
-            result = regex_to_dfa(regex)
+def print_followpos(dfa: dict) -> None:
+    print("\nTabla de siguientePosicion / followpos")
+    print("Pos | Símbolo | followpos")
+    print("----+---------+----------------")
 
-            print("\nExpresión con concatenación explícita:")
-            print(result["original_regex"])
+    for pos in sorted(dfa["pos_to_symbol"]):
+        symbol = dfa["pos_to_symbol"][pos]
+        follow = set_to_str(dfa["followpos"][pos])
+        print(f"{pos:>3} | {symbol:^7} | {follow}")
 
-            print("\nExpresión aumentada:")
-            print(result["augmented_regex"])
 
-            print("\nPostfix:")
-            print(result["postfix"])
+def print_transition_table(dfa: dict) -> None:
+    alphabet = dfa["alphabet"]
+    headers = ["Estado", "Posiciones"] + alphabet
+    rows: List[List[str]] = []
 
-            print_positions(result["pos_to_symbol"])
-            print_syntax_info(result["root"])
-            print_followpos(result["followpos"], result["pos_to_symbol"])
-            print_dfa_table(result["dfa"])
+    for state in dfa["states"]:
+        name = dfa["state_map"][state]
 
-            while True:
-                cadena = input("\nIngrese una cadena para validar (o 'nueva' para otra regex): ").strip()
-                if cadena.lower() == "nueva":
-                    print()
-                    break
+        if state == dfa["start"]:
+            name = "->" + name
+        if state in dfa["accept_states"]:
+            name = "*" + name
 
-                accepted = simulate_dfa(result["dfa"], cadena)
-                if accepted:
-                    print("Resultado: CADENA ACEPTADA")
-                else:
-                    print("Resultado: CADENA RECHAZADA")
+        row = [name, set_to_str(state)]
 
-        except Exception as e:
-            print(f"\nError: {e}\n")
+        for symbol in alphabet:
+            dest = dfa["transitions"].get(state, {}).get(symbol, frozenset())
+            row.append(dfa["state_map"].get(dest, "∅") if dest else "∅")
+
+        rows.append(row)
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def format_line(values: List[str]) -> str:
+        return " | ".join(values[i].ljust(widths[i]) for i in range(len(values)))
+
+    print("\nTabla de transiciones del AFD")
+    print(format_line(headers))
+    print("-+-".join("-" * w for w in widths))
+
+    for row in rows:
+        print(format_line(row))
+
+    print("\n-> estado inicial")
+    print("*  estado de aceptación")
+
+
+def accepts(dfa: dict, text: str) -> bool:
+    """Evalúa una cadena usando el AFD construido."""
+    current = dfa["start"]
+
+    for ch in text:
+        if ch not in dfa["alphabet"]:
+            return False
+
+        current = dfa["transitions"].get(current, {}).get(ch, frozenset())
+
+        if not current:
+            return False
+
+    return current in dfa["accept_states"]
+
+
+def main() -> None:
+    print("Conversión directa de una expresión regular a un AFD")
+    print("Operadores permitidos:")
+    print("  |  unión")
+    print("  concatenación implícita, ejemplo: ab")
+    print("  *  cerradura de Kleene")
+    print("  +  cerradura positiva")
+    print("  ?  opcional")
+    print("Usa ε para la cadena vacía.")
+    print("No uses # porque el programa lo agrega automáticamente.\n")
+
+    expr = input("Ingresa la expresión regular: ")
+
+    try:
+        dfa = build_direct_dfa(expr)
+    except ValueError as error:
+        print(f"\nError: {error}")
+        return
+
+    print(f"\nExpresión aumentada: ({expr})#")
+    print_followpos(dfa)
+    print_transition_table(dfa)
+
+    text = input("\nIngresa una cadena para evaluar: ")
+
+    if accepts(dfa, text):
+        print("Resultado: la cadena PERTENECE al lenguaje.")
+    else:
+        print("Resultado: la cadena NO pertenece al lenguaje.")
 
 
 if __name__ == "__main__":
