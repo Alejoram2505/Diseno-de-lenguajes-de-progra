@@ -5,7 +5,7 @@
 #
 # Soporta operadores:
 #   |   unión
-#   .   concatenación explícita (el programa la agrega)
+#   .   concatenación explícita
 #   *   cerradura de Kleene
 #   +   cerradura positiva
 #   ?   opcional
@@ -576,12 +576,17 @@ def main() -> None:
     print_followpos(dfa)
     print_transition_table(dfa)
 
-    text = input("\nIngresa una cadena para evaluar: ")
+    print("\n(Para probar la cadena vacía ε, presiona Enter sin escribir nada.)")
+    print("(Escribe 'salir' para terminar.)")
 
-    if accepts(dfa, text):
-        print("Resultado: la cadena PERTENECE al lenguaje.")
-    else:
-        print("Resultado: la cadena NO pertenece al lenguaje.")
+    while True:
+        text = input("\nIngresa una cadena para evaluar: ")
+        if text.strip().lower() == "salir":
+            break
+        if accepts(dfa, text):
+            print("Resultado: la cadena PERTENECE al lenguaje.")
+        else:
+            print("Resultado: la cadena NO pertenece al lenguaje.")
 
 
 if __name__ == "__main__":
